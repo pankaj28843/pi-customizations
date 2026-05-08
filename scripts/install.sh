@@ -19,7 +19,10 @@ if [[ -e "$install_link" && ! -L "$install_link" ]]; then
   exit 1
 fi
 
-ln -sfnT "$repo_root" "$install_link"
+if [[ -L "$install_link" ]]; then
+  rm "$install_link"
+fi
+ln -s "$repo_root" "$install_link"
 
 echo "Installed pi-customizations extension symlink:"
 echo "  $install_link -> $repo_root"
