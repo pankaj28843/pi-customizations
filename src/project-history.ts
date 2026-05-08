@@ -1,0 +1,520 @@
+export type ProjectHistoryRole = "user" | "assistant";
+export type ProjectHistoryRoleFilter = ProjectHistoryRole | "all";
+
+export interface ProjectHistorySession {
+	path: string;
+	id: string;
+	cwd?: string;
+	name?: string;
+	created?: Date | string | number;
+	modified?: Date | string | number;
+	firstMessage?: string;
+}
+
+export interface SearchDocument {
+	sessionPath: string;
+	sessionId: string;
+	sessionName?: string;
+	sessionCwd?: string;
+	sessionCreated?: Date;
+	sessionModified?: Date;
+	sessionFirstMessage?: string;
+	entryId: string;
+	timestamp?: Date;
+	role: ProjectHistoryRole;
+	text: string;
+	lineNumber?: number;
+}
+
+export interface ProjectHistorySearchOptions {
+	query: string;
+	role?: ProjectHistoryRoleFilter;
+	limit?: number;
+	maxSnippetLength?: number;
+}
+
+export interface ProjectHistorySearchResult extends SearchDocument {
+	score: number;
+	snippet: string;
+	matchedTokens: string[];
+}
+
+export interface HistoryCommandOptions {
+	query: string;
+	role: ProjectHistoryRoleFilter;
+	limit: number;
+}
+
+export interface HistoryCommandParseError {
+	error: string;
+}
+
+export interface HistoryResultsSummary {
+	query: string;
+	role?: ProjectHistoryRoleFilter;
+	searchedSessions?: number;
+	searchedDocuments?: number;
+	limit?: number;
+	maxOutputChars?: number;
+}
+
+interface InternalDocument {
+	entryId: string;
+	timestamp?: Date;
+	role: ProjectHistoryRole;
+	text: string;
+	lineNumber?: number;
+}
+
+const DEFAULT_HISTORY_LIMIT = 8;
+const MAX_HISTORY_LIMIT = 50;
+const DEFAULT_SNIPPET_LENGTH = 320;
+const DEFAULT_MAX_OUTPUT_CHARS = 12_000;
+const USAGE = "Usage: /history [--role user|assistant|all] [--limit 1-50] <query>";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function cleanOptionalString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function dateFromUnknown(value: unknown): Date | undefined {
+	if (value instanceof Date) {
+		return Number.isNaN(value.getTime()) ? undefined : new Date(value.getTime());
+	}
+
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) return undefined;
+		const date = new Date(value);
+		return Number.isNaN(date.getTime()) ? undefined : date;
+	}
+
+	if (typeof value === "string") {
+		const date = new Date(value);
+		return Number.isNaN(date.getTime()) ? undefined : date;
+	}
+
+	return undefined;
+}
+
+function timeValue(date: Date | undefined): number {
+	return date?.getTime() ?? 0;
+}
+
+function collapseWhitespace(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeSearchText(text: string): string {
+	return collapseWhitespace(text).toLowerCase();
+}
+
+function tokenizeSearchText(text: string): string[] {
+	return text
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter(Boolean);
+}
+
+function uniqueTokens(text: string): string[] {
+	return [...new Set(tokenizeSearchText(text))];
+}
+
+function countOccurrences(values: readonly string[], token: string): number {
+	let count = 0;
+	for (const value of values) {
+		if (value === token) count += 1;
+	}
+	return count;
+}
+
+function tokensInOrder(text: string, tokens: readonly string[]): boolean {
+	let offset = 0;
+	for (const token of tokens) {
+		const index = text.indexOf(token, offset);
+		if (index === -1) return false;
+		offset = index + token.length;
+	}
+	return true;
+}
+
+function scoreDocument(
+	document: SearchDocument,
+	normalizedQuery: string,
+	queryTokens: readonly string[],
+): { score: number; matchedTokens: string[] } | undefined {
+	if (!normalizedQuery || queryTokens.length === 0) return undefined;
+
+	const normalizedText = normalizeSearchText(document.text);
+	if (!normalizedText) return undefined;
+
+	const documentTokens = tokenizeSearchText(normalizedText);
+	const matchedTokens = queryTokens.filter((token) => documentTokens.includes(token));
+	const phraseIndex = normalizedText.indexOf(normalizedQuery);
+
+	if (phraseIndex === -1 && matchedTokens.length === 0) return undefined;
+
+	let score = 0;
+	if (phraseIndex !== -1) {
+		score += 1_000;
+		if (phraseIndex === 0) score += 50;
+	}
+
+	for (const token of matchedTokens) {
+		score += 30 * countOccurrences(documentTokens, token);
+	}
+
+	if (matchedTokens.length === queryTokens.length) score += 150;
+	if (tokensInOrder(normalizedText, queryTokens)) score += 75;
+	if (document.role === "user") score += 10;
+
+	return { score, matchedTokens };
+}
+
+function createSnippet(text: string, normalizedQuery: string, queryTokens: readonly string[], maxLength: number): string {
+	const compact = collapseWhitespace(text);
+	const max = Math.max(20, Math.floor(maxLength));
+	if (compact.length <= max) return compact;
+
+	const lower = compact.toLowerCase();
+	let matchIndex = normalizedQuery ? lower.indexOf(normalizedQuery) : -1;
+	if (matchIndex === -1) {
+		const tokenIndexes = queryTokens
+			.map((token) => lower.indexOf(token))
+			.filter((index) => index >= 0)
+			.sort((a, b) => a - b);
+		matchIndex = tokenIndexes[0] ?? 0;
+	}
+
+	const initialWindow = Math.max(1, max - 2);
+	let start = Math.max(0, matchIndex - Math.floor(initialWindow / 2));
+	let end = Math.min(compact.length, start + initialWindow);
+	if (end === compact.length) start = Math.max(0, end - initialWindow);
+
+	let prefix = start > 0 ? "…" : "";
+	let suffix = end < compact.length ? "…" : "";
+	const allowedWindow = Math.max(1, max - prefix.length - suffix.length);
+
+	start = Math.max(0, matchIndex - Math.floor(allowedWindow / 2));
+	end = Math.min(compact.length, start + allowedWindow);
+	if (end - start < allowedWindow) start = Math.max(0, end - allowedWindow);
+
+	prefix = start > 0 ? "…" : "";
+	suffix = end < compact.length ? "…" : "";
+	let snippet = `${prefix}${compact.slice(start, end)}${suffix}`;
+	if (snippet.length > max) {
+		snippet = `${snippet.slice(0, Math.max(0, max - 1))}…`;
+	}
+	return snippet;
+}
+
+export function extractMessageText(content: unknown): string {
+	if (typeof content === "string") {
+		return content.trim();
+	}
+
+	if (!Array.isArray(content)) {
+		return "";
+	}
+
+	const parts: string[] = [];
+	for (const part of content) {
+		if (!isRecord(part)) continue;
+		if (part.type === "text" && typeof part.text === "string") {
+			const text = part.text.trim();
+			if (text) parts.push(text);
+		}
+	}
+
+	return parts.join("\n").trim();
+}
+
+export function parseSessionFileText(text: string, session: ProjectHistorySession): SearchDocument[] {
+	let sessionId = session.id;
+	let sessionCwd = cleanOptionalString(session.cwd);
+	let sessionName = cleanOptionalString(session.name);
+	const sessionCreated = dateFromUnknown(session.created);
+	const sessionModified = dateFromUnknown(session.modified);
+	const sessionFirstMessage = cleanOptionalString(session.firstMessage);
+	const documents: InternalDocument[] = [];
+
+	const lines = text.split(/\r?\n/);
+	for (const [index, rawLine] of lines.entries()) {
+		const line = rawLine.trim();
+		if (!line) continue;
+
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (!isRecord(entry)) continue;
+
+		if (entry.type === "session") {
+			const headerId = cleanOptionalString(entry.id);
+			const headerCwd = cleanOptionalString(entry.cwd);
+			if (headerId) sessionId = headerId;
+			if (headerCwd) sessionCwd = headerCwd;
+			continue;
+		}
+
+		if (entry.type === "session_info") {
+			sessionName = cleanOptionalString(entry.name);
+			continue;
+		}
+
+		if (entry.type !== "message" || !isRecord(entry.message)) continue;
+		const role = entry.message.role;
+		if (role !== "user" && role !== "assistant") continue;
+
+		const messageText = extractMessageText(entry.message.content);
+		if (!messageText) continue;
+
+		const entryId = cleanOptionalString(entry.id) ?? `line-${index + 1}`;
+		const timestamp = dateFromUnknown(entry.timestamp) ?? dateFromUnknown(entry.message.timestamp);
+		const internalDocument: InternalDocument = {
+			entryId,
+			role,
+			text: messageText,
+			lineNumber: index + 1,
+		};
+		if (timestamp) internalDocument.timestamp = timestamp;
+		documents.push(internalDocument);
+	}
+
+	return documents.map((document) => {
+		const searchDocument: SearchDocument = {
+			sessionPath: session.path,
+			sessionId,
+			entryId: document.entryId,
+			role: document.role,
+			text: document.text,
+		};
+		if (sessionName) searchDocument.sessionName = sessionName;
+		if (sessionCwd) searchDocument.sessionCwd = sessionCwd;
+		if (sessionCreated) searchDocument.sessionCreated = sessionCreated;
+		if (sessionModified) searchDocument.sessionModified = sessionModified;
+		if (sessionFirstMessage) searchDocument.sessionFirstMessage = sessionFirstMessage;
+		if (document.timestamp) searchDocument.timestamp = document.timestamp;
+		if (document.lineNumber !== undefined) searchDocument.lineNumber = document.lineNumber;
+		return searchDocument;
+	});
+}
+
+export function searchHistoryDocuments(
+	documents: readonly SearchDocument[],
+	options: ProjectHistorySearchOptions,
+): ProjectHistorySearchResult[] {
+	const query = options.query.trim();
+	if (!query) return [];
+
+	const role = options.role ?? "user";
+	const limit = Math.min(Math.max(1, Math.floor(options.limit ?? DEFAULT_HISTORY_LIMIT)), MAX_HISTORY_LIMIT);
+	const maxSnippetLength = Math.max(20, Math.floor(options.maxSnippetLength ?? DEFAULT_SNIPPET_LENGTH));
+	const normalizedQuery = normalizeSearchText(query);
+	const queryTokens = uniqueTokens(query);
+
+	return documents
+		.filter((document) => role === "all" || document.role === role)
+		.map((document) => {
+			const scored = scoreDocument(document, normalizedQuery, queryTokens);
+			if (!scored) return undefined;
+			const result: ProjectHistorySearchResult = {
+				...document,
+				score: scored.score,
+				snippet: createSnippet(document.text, normalizedQuery, queryTokens, maxSnippetLength),
+				matchedTokens: scored.matchedTokens,
+			};
+			return result;
+		})
+		.filter((result): result is ProjectHistorySearchResult => result !== undefined)
+		.sort(
+			(a, b) =>
+				b.score - a.score ||
+				timeValue(b.sessionModified) - timeValue(a.sessionModified) ||
+				timeValue(b.timestamp) - timeValue(a.timestamp) ||
+				a.sessionPath.localeCompare(b.sessionPath) ||
+				a.entryId.localeCompare(b.entryId),
+		)
+		.slice(0, limit);
+}
+
+function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+	return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+function formatTimestamp(date: Date | undefined): string {
+	return date ? date.toISOString() : "unknown time";
+}
+
+function resultSessionLabel(result: ProjectHistorySearchResult): string {
+	return result.sessionName ? `${result.sessionName} (${result.sessionId})` : result.sessionId;
+}
+
+export function formatHistoryResults(
+	results: readonly ProjectHistorySearchResult[],
+	summary: HistoryResultsSummary,
+): string {
+	const role = summary.role ?? "user";
+	const sessions = summary.searchedSessions === undefined ? undefined : plural(summary.searchedSessions, "session");
+	const documents =
+		summary.searchedDocuments === undefined ? undefined : plural(summary.searchedDocuments, "message");
+	const scope = [sessions, documents].filter((part): part is string => part !== undefined).join(", ");
+	const headerSuffix = scope ? ` across ${scope}` : "";
+
+	if (results.length === 0) {
+		return `No project history matches for "${summary.query}" (role: ${role})${headerSuffix}.\n${USAGE}`;
+	}
+
+	const lines = [`Project history matches for "${summary.query}" (role: ${role})${headerSuffix}:`];
+	for (const [index, result] of results.entries()) {
+		lines.push(
+			`${index + 1}. ${resultSessionLabel(result)} — ${formatTimestamp(result.timestamp)} — role=${result.role} entry=${result.entryId} score=${result.score}`,
+		);
+		lines.push(`   path: ${result.sessionPath}`);
+		if (result.lineNumber !== undefined) lines.push(`   line: ${result.lineNumber}`);
+		lines.push(`   snippet: ${result.snippet}`);
+	}
+
+	const output = lines.join("\n");
+	const maxOutputChars = Math.max(500, Math.floor(summary.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS));
+	if (output.length <= maxOutputChars) return output;
+
+	return `${output.slice(0, maxOutputChars - 80)}\n…\n[project history output truncated to ${maxOutputChars} characters]`;
+}
+
+function splitCommandArgs(args: string): string[] | HistoryCommandParseError {
+	const words: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaping = false;
+
+	for (const char of args) {
+		if (escaping) {
+			current += char;
+			escaping = false;
+			continue;
+		}
+
+		if (char === "\\" && quote !== "'") {
+			escaping = true;
+			continue;
+		}
+
+		if (quote) {
+			if (char === quote) {
+				quote = undefined;
+			} else {
+				current += char;
+			}
+			continue;
+		}
+
+		if (char === "'" || char === '"') {
+			quote = char;
+			continue;
+		}
+
+		if (/\s/.test(char)) {
+			if (current) {
+				words.push(current);
+				current = "";
+			}
+			continue;
+		}
+
+		current += char;
+	}
+
+	if (escaping) current += "\\";
+	if (quote) return { error: `Unclosed quote in history arguments. ${USAGE}` };
+	if (current) words.push(current);
+	return words;
+}
+
+function parseRole(value: string): ProjectHistoryRoleFilter | undefined {
+	const normalized = value.toLowerCase();
+	if (normalized === "user" || normalized === "assistant" || normalized === "all") return normalized;
+	return undefined;
+}
+
+function parseLimit(value: string): number | undefined {
+	if (!/^\d+$/.test(value)) return undefined;
+	const parsed = Number.parseInt(value, 10);
+	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_HISTORY_LIMIT) return undefined;
+	return parsed;
+}
+
+export function parseHistoryCommandArgs(args: string): HistoryCommandOptions | HistoryCommandParseError {
+	const wordsOrError = splitCommandArgs(args);
+	if (!Array.isArray(wordsOrError)) return wordsOrError;
+
+	let role: ProjectHistoryRoleFilter = "user";
+	let limit = DEFAULT_HISTORY_LIMIT;
+	const queryParts: string[] = [];
+	let endOfOptions = false;
+
+	for (let index = 0; index < wordsOrError.length; index += 1) {
+		const word = wordsOrError[index];
+		if (word === undefined) continue;
+
+		if (endOfOptions || !word.startsWith("--")) {
+			queryParts.push(word);
+			continue;
+		}
+
+		if (word === "--") {
+			endOfOptions = true;
+			continue;
+		}
+
+		if (word === "--role") {
+			const value = wordsOrError[index + 1];
+			if (value === undefined) return { error: `Missing value for --role. ${USAGE}` };
+			const parsed = parseRole(value);
+			if (!parsed) return { error: `Invalid role "${value}". ${USAGE}` };
+			role = parsed;
+			index += 1;
+			continue;
+		}
+
+		if (word.startsWith("--role=")) {
+			const value = word.slice("--role=".length);
+			const parsed = parseRole(value);
+			if (!parsed) return { error: `Invalid role "${value}". ${USAGE}` };
+			role = parsed;
+			continue;
+		}
+
+		if (word === "--limit") {
+			const value = wordsOrError[index + 1];
+			if (value === undefined) return { error: `Missing value for --limit. ${USAGE}` };
+			const parsed = parseLimit(value);
+			if (parsed === undefined) return { error: `Invalid limit "${value}". ${USAGE}` };
+			limit = parsed;
+			index += 1;
+			continue;
+		}
+
+		if (word.startsWith("--limit=")) {
+			const value = word.slice("--limit=".length);
+			const parsed = parseLimit(value);
+			if (parsed === undefined) return { error: `Invalid limit "${value}". ${USAGE}` };
+			limit = parsed;
+			continue;
+		}
+
+		return { error: `Unknown history option "${word}". ${USAGE}` };
+	}
+
+	return {
+		query: queryParts.join(" ").trim(),
+		role,
+		limit,
+	};
+}

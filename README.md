@@ -10,6 +10,7 @@ The repo is meant to be cloned, installed, and adapted by anyone who wants a sta
 | --- | --- | --- |
 | Codex Fast Mode | Extension command + CLI flag | Optionally adds `service_tier: "priority"` to OpenAI / OpenAI Codex provider payloads when enabled. |
 | Inline Skill Slash Autocomplete | Extension autocomplete + editor + input transform | Lets `/skill:<name>` autocomplete work inside prose and expands known inline skill tokens before submit. |
+| Project History Search | Extension command + LLM tool | Searches saved local pi sessions for the current project and lets you inject or resume matching history. |
 
 More customizations can be added under `src/` and registered from `index.ts`.
 
@@ -67,6 +68,32 @@ For a project-local install:
 ```bash
 pi install -l git:github.com/<owner>/pi-customizations
 ```
+
+## Using project history search
+
+Inside pi, search saved sessions for the current project/worktree:
+
+```text
+/history adapter retries
+/history --role user --limit 20 semantic scholar
+/history --role all database vacuum
+```
+
+`/history` with no query opens an interactive prompt. Results are ranked lexical matches with session name/id, timestamp, role, entry id, file path, and bounded snippets. In interactive mode, selecting a match offers actions to:
+
+1. inject the selected snippet into the next turn, prefilled with `Using the project history above,`, or
+2. switch to the matching session file.
+
+The extension also registers the `project_history_search` tool for the model. Ask naturally, for example:
+
+```text
+Search my project history for the adapter retry discussion.
+Do you remember when I asked about Semantic Scholar in this repo?
+```
+
+The tool is for local pi session-history recall only. It reads pi JSONL session files from the current project's pi session directory, uses deterministic lexical search, bounds/truncates results, and does not make network calls, use embeddings, create an external database, or send telemetry.
+
+Current limitations: it searches pi sessions for the current project only; it does not search Claude/Codex histories, all projects, synced machines, or semantic/vector indexes.
 
 ## Using inline `/skill:` autocomplete
 
