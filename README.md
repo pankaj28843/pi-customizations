@@ -76,7 +76,7 @@ The package installs an editor customization and autocomplete provider that make
 Please use /skill:dev-go to review this
 ```
 
-Typing `/ski` or `/skill:` after prose opens autocomplete. Selecting a skill replaces only the active slash token, preserving surrounding text.
+Typing `/ski`, `/dev`, `/prp`, or `/skill:` after prose opens token-aware autocomplete. Selecting a skill replaces only the active slash token, preserving surrounding text.
 
 On submit, known inline `/skill:<name>` tokens are expanded to the same `<skill ...>` block used by pi's normal start-of-message `/skill:<name>` command. Unknown skill tokens remain literal. Built-in control-plane slash commands still only execute at the start of a prompt.
 

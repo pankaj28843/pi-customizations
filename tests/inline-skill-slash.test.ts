@@ -83,6 +83,12 @@ const commands: SlashCommandInfo[] = [
 		source: "skill",
 		sourceInfo: { path: "/virtual/dev-tdd/SKILL.md", source: "local", scope: "project", origin: "top-level" },
 	},
+	{
+		name: "skill:plan-prp",
+		description: "Plan PRP workflow",
+		source: "skill",
+		sourceInfo: { path: "/virtual/plan-prp/SKILL.md", source: "local", scope: "project", origin: "top-level" },
+	},
 ];
 const provider = createInlineSlashAutocompleteProvider(fallbackProvider, () => commands);
 
@@ -90,13 +96,25 @@ const inlineSki = await provider.getSuggestions(["please /ski"], 0, "please /ski
 	signal: new AbortController().signal,
 });
 assert.equal(inlineSki?.prefix, "/ski");
-assert.deepEqual(inlineSki?.items.map((item) => item.value), ["skill:dev-go", "skill:dev-tdd"]);
+assert.deepEqual(inlineSki?.items.map((item) => item.value), ["skill:dev-go", "skill:dev-tdd", "skill:plan-prp"]);
 
 const inlineSkillDev = await provider.getSuggestions(["please /skill:dev"], 0, "please /skill:dev".length, {
 	signal: new AbortController().signal,
 });
 assert.equal(inlineSkillDev?.prefix, "/skill:dev");
 assert.deepEqual(inlineSkillDev?.items.map((item) => item.value), ["skill:dev-go", "skill:dev-tdd"]);
+
+const inlineBareDev = await provider.getSuggestions(["please /dev"], 0, "please /dev".length, {
+	signal: new AbortController().signal,
+});
+assert.equal(inlineBareDev?.prefix, "/dev");
+assert.deepEqual(inlineBareDev?.items.map((item) => item.value), ["skill:dev-go", "skill:dev-tdd"]);
+
+const inlinePrp = await provider.getSuggestions(["please /prp"], 0, "please /prp".length, {
+	signal: new AbortController().signal,
+});
+assert.equal(inlinePrp?.prefix, "/prp");
+assert.deepEqual(inlinePrp?.items.map((item) => item.value), ["skill:plan-prp"]);
 
 const applied = provider.applyCompletion(
 	["please /ski"],
@@ -107,6 +125,16 @@ const applied = provider.applyCompletion(
 );
 assert.equal(applied.lines[0], "please /skill:dev-go ");
 assert.equal(applied.cursorCol, "please /skill:dev-go ".length);
+
+const appliedPrp = provider.applyCompletion(
+	["please /prp"],
+	0,
+	"please /prp".length,
+	{ value: "skill:plan-prp", label: "skill:plan-prp" },
+	"/prp",
+);
+assert.equal(appliedPrp.lines[0], "please /skill:plan-prp ");
+assert.equal(appliedPrp.cursorCol, "please /skill:plan-prp ".length);
 
 const pathResult = await provider.getSuggestions(["please /tmp"], 0, "please /tmp".length, {
 	signal: new AbortController().signal,

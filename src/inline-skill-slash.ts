@@ -59,11 +59,57 @@ export function getInlineSlashCommands(getCommands: CommandProvider): Autocomple
 	}));
 }
 
+function tokenizeCommandText(text: string): string[] {
+	return text
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter(Boolean);
+}
+
+function commandSearchAliases(item: AutocompleteItem): string[] {
+	const aliases = new Set([item.value.toLowerCase(), item.label.toLowerCase()]);
+
+	for (const alias of [...aliases]) {
+		const colonIndex = alias.indexOf(":");
+		if (colonIndex !== -1 && colonIndex < alias.length - 1) {
+			aliases.add(alias.slice(colonIndex + 1));
+		}
+	}
+
+	return [...aliases];
+}
+
+function slashCommandMatchScore(item: AutocompleteItem, query: string): number | undefined {
+	const aliases = commandSearchAliases(item);
+	let bestScore: number | undefined;
+	const recordScore = (score: number): void => {
+		bestScore = bestScore === undefined ? score : Math.min(bestScore, score);
+	};
+
+	for (const alias of aliases) {
+		if (alias === query) recordScore(0);
+		else if (alias.startsWith(query)) recordScore(10);
+	}
+
+	const tokens = new Set(aliases.flatMap(tokenizeCommandText));
+	for (const token of tokens) {
+		if (token === query) recordScore(20);
+		else if (token.startsWith(query)) recordScore(30);
+	}
+
+	return bestScore;
+}
+
 export function filterSlashCommands(commands: readonly AutocompleteItem[], query: string): AutocompleteItem[] {
 	const normalizedQuery = query.trim().toLowerCase();
 	if (!normalizedQuery) return commands.slice(0, 20);
 
-	return commands.filter((item) => item.value.toLowerCase().startsWith(normalizedQuery)).slice(0, 20);
+	return commands
+		.map((item, index) => ({ item, index, score: slashCommandMatchScore(item, normalizedQuery) }))
+		.filter((entry): entry is { item: AutocompleteItem; index: number; score: number } => entry.score !== undefined)
+		.sort((a, b) => a.score - b.score || a.index - b.index)
+		.slice(0, 20)
+		.map((entry) => entry.item);
 }
 
 function getSlashCommandSuggestions(
