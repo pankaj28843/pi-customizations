@@ -6,7 +6,7 @@ import {
 	type SettingsReadError,
 } from "../settings.js";
 
-const STATUS_KEY = "pankaj-codex-fast";
+const STATUS_KEY = "pi-customizations-codex-fast";
 const SUPPORTED_PROVIDERS = new Set(["openai", "openai-codex"]);
 
 type CommandAction = "off" | "on" | "status" | "toggle";

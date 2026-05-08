@@ -1,17 +1,18 @@
 {
   "name": "pi-customizations",
   "version": "0.1.0",
-  "description": "Pankaj's pi coding-agent customizations and extensions.",
+  "description": "Reusable pi coding-agent customizations and extensions.",
   "type": "module",
   "packageManager": "pnpm@10.20.0",
   "engines": {
     "node": ">=20"
   },
   "keywords": [
+    "pi",
     "pi-package",
     "pi-extension",
-    "codex",
-    "openai"
+    "customizations",
+    "coding-agent"
   ],
   "license": "MIT",
   "scripts": {

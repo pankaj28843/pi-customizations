@@ -1,13 +1,22 @@
 # pi-customizations
 
-Pankaj's public pi customization package.
+A reusable pi customization package for extensions, commands, flags, themes, prompt templates, and other pi add-ons.
 
-First extension: **Codex Fast Mode**, a local version of [`calesennett/pi-codex-fast`](https://github.com/calesennett/pi-codex-fast) for current pi (`@earendil-works/pi-coding-agent`). It can add `service_tier: "priority"` to OpenAI / OpenAI Codex provider payloads.
+The repo is meant to be cloned, installed, and adapted by anyone who wants a starting point for pi customizations. It intentionally keeps runtime source in TypeScript so pi can load the package directly.
 
-## Install locally
+## What's included
+
+| Customization | Type | Summary |
+| --- | --- | --- |
+| Codex Fast Mode | Extension command + CLI flag | Optionally adds `service_tier: "priority"` to OpenAI / OpenAI Codex provider payloads when enabled. |
+
+More customizations can be added under `src/` and registered from `index.ts`.
+
+## Install from a clone
 
 ```bash
-cd ~/Personal/Code/pi-customizations
+git clone <this-repo-url> pi-customizations
+cd pi-customizations
 make install
 ```
 
@@ -46,21 +55,19 @@ make uninstall
 
 ## Install as a pi git package
 
-Once pushed to GitHub:
+Use this repo's Git URL:
 
 ```bash
-pi install git:github.com/pankaj28843/pi-customizations
+pi install git:github.com/<owner>/pi-customizations
 ```
 
 For a project-local install:
 
 ```bash
-pi install -l git:github.com/pankaj28843/pi-customizations
+pi install -l git:github.com/<owner>/pi-customizations
 ```
 
-## Codex Fast Mode
-
-### Commands
+## Using the included Codex Fast Mode extension
 
 Inside pi:
 
@@ -77,21 +84,7 @@ From the CLI for one session:
 pi --fast
 ```
 
-### Behavior
-
-The extension patches provider payloads only when all of these are true:
-
-- Codex fast mode is enabled.
-- The active provider is `openai` or `openai-codex`.
-- The outgoing payload does not already include `service_tier`.
-
-When active, it returns a modified payload with:
-
-```json
-{ "service_tier": "priority" }
-```
-
-### Settings
+The extension only patches provider payloads when fast mode is enabled, the active provider is `openai` or `openai-codex`, and the outgoing payload does not already include `service_tier`.
 
 Persistent state is read from effective pi settings:
 
@@ -110,17 +103,7 @@ Preferred key:
 }
 ```
 
-For compatibility with the upstream package, this key is also read:
-
-```json
-{
-  "pi-codex-fast": {
-    "enabled": true
-  }
-}
-```
-
-Writes from `/codex-fast on|off` go to the global preferred key.
+The upstream-compatible `pi-codex-fast.enabled` key is also read. Writes from `/codex-fast on|off` go to the preferred key.
 
 ## Development
 
@@ -134,7 +117,7 @@ make smoke
 
 This repo intentionally ships TypeScript source. Pi loads extension `.ts` files directly via its extension loader, so the build step is type-checking rather than transpilation.
 
-## Docs used
+## Reference docs
 
 - Pi package docs: packages can declare resources under the `pi` key in `package.json`.
 - Pi extension docs: extensions can register flags, commands, event handlers, and mutate `before_provider_request` payloads.
