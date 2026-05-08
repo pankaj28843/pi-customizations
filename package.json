@@ -1,0 +1,37 @@
+{
+  "name": "pi-customizations",
+  "version": "0.1.0",
+  "description": "Pankaj's pi coding-agent customizations and extensions.",
+  "type": "module",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "openai"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "pnpm typecheck",
+    "check": "pnpm typecheck && pnpm test",
+    "test": "tsx tests/settings.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
