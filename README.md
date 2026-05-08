@@ -9,6 +9,7 @@ The repo is meant to be cloned, installed, and adapted by anyone who wants a sta
 | Customization | Type | Summary |
 | --- | --- | --- |
 | Codex Fast Mode | Extension command + CLI flag | Optionally adds `service_tier: "priority"` to OpenAI / OpenAI Codex provider payloads when enabled. |
+| Inline Skill Slash Autocomplete | Extension autocomplete + editor + input transform | Lets `/skill:<name>` autocomplete work inside prose and expands known inline skill tokens before submit. |
 
 More customizations can be added under `src/` and registered from `index.ts`.
 
@@ -66,6 +67,18 @@ For a project-local install:
 ```bash
 pi install -l git:github.com/<owner>/pi-customizations
 ```
+
+## Using inline `/skill:` autocomplete
+
+The package installs an editor customization and autocomplete provider that make slash command tokens cursor-local instead of message-start-only for installed commands. This is most useful for skills:
+
+```text
+Please use /skill:dev-go to review this
+```
+
+Typing `/ski` or `/skill:` after prose opens autocomplete. Selecting a skill replaces only the active slash token, preserving surrounding text.
+
+On submit, known inline `/skill:<name>` tokens are expanded to the same `<skill ...>` block used by pi's normal start-of-message `/skill:<name>` command. Unknown skill tokens remain literal. Built-in control-plane slash commands still only execute at the start of a prompt.
 
 ## Using the included Codex Fast Mode extension
 

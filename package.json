@@ -18,7 +18,7 @@
   "scripts": {
     "build": "pnpm typecheck",
     "check": "pnpm typecheck && pnpm test",
-    "test": "tsx tests/settings.test.ts",
+    "test": "tsx tests/settings.test.ts && tsx tests/inline-skill-slash.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
@@ -27,10 +27,12 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
     "@types/node": "^24.10.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
