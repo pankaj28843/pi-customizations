@@ -10,7 +10,7 @@ The repo is meant to be cloned, installed, and adapted by anyone who wants a sta
 | --- | --- | --- |
 | Codex Fast Mode | Extension command + CLI flag | Optionally adds `service_tier: "priority"` to OpenAI / OpenAI Codex provider payloads when enabled. |
 | Inline Skill Slash Autocomplete | Extension autocomplete + editor + input transform | Lets `/skill:<name>` autocomplete work inside prose and expands known inline skill tokens before submit. |
-| Project History Search | Extension command + LLM tool | Searches saved local pi sessions for the current project and lets you inject or resume matching history. |
+| Project History Search | Extension command + LLM tool + editor history | Searches saved local pi sessions, restores matching prompts, and adds prior project prompts to normal ↑/↓ editor history. |
 
 More customizations can be added under `src/` and registered from `index.ts`.
 
@@ -79,10 +79,16 @@ Inside pi, search saved sessions for the current project/worktree:
 /history --role all database vacuum
 ```
 
-`/history` with no query opens an interactive prompt. Results are ranked lexical matches with session name/id, timestamp, role, entry id, file path, and bounded snippets. In interactive mode, selecting a match offers actions to:
+`/history` with no query opens an interactive searchable picker seeded with the newest project prompt selected. Typing filters live; space-separated non-empty tokens are treated as case-insensitive regexes and matched with OR semantics. Matches always stay in reverse chronological order, and snippets show highlighted surrounding text so long or multi-line prompts remain recognizable.
 
-1. inject the selected snippet into the next turn, prefilled with `Using the project history above,`, or
+History restores prompts in user-facing form: expanded `<skill ...>...</skill>` blocks are collapsed back to `/skill:<name>` shorthand, so prompt history does not paste full skill bodies into the editor.
+
+The `/history ...` editor line also has argument autocomplete backed by recent project prompts. In interactive mode, selecting a match offers actions to:
+
+1. restore the full matching user prompt to the editor exactly as prompt text (no session metadata snippet is queued), or
 2. switch to the matching session file.
+
+The extension also seeds pi's normal prompt-history navigation with prior user prompts from this project. Press ↑ on an empty editor to browse older prompts from previous project sessions; press ↓ to move back toward the blank/current editor, just like same-session history.
 
 The extension also registers the `project_history_search` tool for the model. Ask naturally, for example:
 

@@ -1,12 +1,27 @@
 import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
-import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import {
+	SessionManager,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type KeybindingsManager,
+	type SessionInfo,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
+import { Input, truncateToWidth, visibleWidth, type AutocompleteItem, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { InlineSlashAutocompleteEditor } from "../inline-skill-slash.js";
+import {
+	collectUserPromptHistory,
 	formatHistoryResults,
+	highlightHistorySnippet,
 	parseHistoryCommandArgs,
 	parseSessionFileText,
 	searchHistoryDocuments,
+	seedPromptHistory,
+	splitHistoryQuery,
+	type ProjectHistoryPrompt,
 	type ProjectHistoryRoleFilter,
 	type ProjectHistorySearchResult,
 	type ProjectHistorySession,
@@ -14,9 +29,13 @@ import {
 } from "../project-history.js";
 
 const STATUS_KEY = "pi-customizations-project-history";
+const PROMPT_HISTORY_STATUS_KEY = "pi-customizations-project-history-prompts";
 const DEFAULT_TOOL_LIMIT = 8;
 const MAX_TOOL_LIMIT = 50;
 const TOOL_MAX_OUTPUT_CHARS = 10_000;
+const EDITOR_PROMPT_HISTORY_LIMIT = 100;
+const COMMAND_COMPLETION_LIMIT = 20;
+const HISTORY_PICKER_SNIPPET_LENGTH = 420;
 
 const ProjectHistorySearchParams = Type.Object({
 	query: Type.String({ description: "Text to search for in saved pi sessions for the current project." }),
@@ -90,13 +109,9 @@ function compactLabel(text: string, maxLength: number): string {
 	return `${compact.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-function formatResultChoice(result: ProjectHistorySearchResult, index: number): string {
-	const sessionLabel = result.sessionName ?? result.sessionId;
-	const timestamp = result.timestamp?.toISOString().slice(0, 10) ?? "unknown";
-	return compactLabel(
-		`${index + 1}. ${sessionLabel} ${timestamp} ${result.role} entry=${result.entryId}: ${result.snippet}`,
-		180,
-	);
+function compactCompletionValue(text: string, maxLength: number): string {
+	const compact = text.replace(/\s+/g, " ").trim();
+	return compact.length <= maxLength ? compact : compact.slice(0, maxLength).trimEnd();
 }
 
 function serializeResult(result: ProjectHistorySearchResult) {
@@ -112,21 +127,6 @@ function serializeResult(result: ProjectHistorySearchResult) {
 		snippet: result.snippet,
 		matchedTokens: result.matchedTokens,
 	};
-}
-
-function buildInjectedHistoryContent(result: ProjectHistorySearchResult, query: string): string {
-	const title = result.sessionName ? `${result.sessionName} (${result.sessionId})` : result.sessionId;
-	return [
-		`Project history match for query: ${query}`,
-		`Session: ${title}`,
-		`Session path: ${result.sessionPath}`,
-		`Entry: ${result.entryId}`,
-		`Role: ${result.role}`,
-		`Timestamp: ${result.timestamp?.toISOString() ?? "unknown"}`,
-		"",
-		"Snippet:",
-		result.snippet,
-	].join("\n");
 }
 
 function normalizeToolParams(params: {
@@ -244,54 +244,184 @@ async function promptForQuery(args: string, ctx: ExtensionCommandContext): Promi
 		return undefined;
 	}
 
-	let query = parsed.query;
-	if (!query) {
-		if (!ctx.hasUI) {
-			notifyOrPrint(ctx, "Usage: /history [--role user|assistant|all] [--limit 1-50] <query>", "info");
-			return undefined;
-		}
-
-		const prompted = await ctx.ui.input("Search project history", "What should pi remember from this project?");
-		query = prompted?.trim() ?? "";
-		if (!query) return undefined;
-	}
-
 	return {
-		query,
+		query: parsed.query,
 		role: parsed.role,
 		limit: parsed.limit,
 		includeCurrentSession: true,
 	};
 }
 
-async function handleInteractiveActions(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	query: string,
-	results: readonly ProjectHistorySearchResult[],
-): Promise<void> {
-	const choices = results.map((result, index) => formatResultChoice(result, index));
-	const selectedChoice = await ctx.ui.select("Project history matches", choices);
-	if (!selectedChoice) return;
+function padToWidth(line: string, width: number): string {
+	return `${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}`;
+}
 
-	const selectedIndex = choices.indexOf(selectedChoice);
-	const selected = selectedIndex >= 0 ? results[selectedIndex] : undefined;
-	if (!selected) return;
+function formatHistoryResultMetadata(result: ProjectHistorySearchResult): string {
+	const sessionLabel = result.sessionName ?? result.sessionId;
+	const timestamp = result.timestamp?.toISOString().replace("T", " ").slice(0, 16) ?? "unknown time";
+	return `${timestamp} ${result.role} ${sessionLabel} entry=${result.entryId}`;
+}
 
-	const action = await ctx.ui.select("History action", ["Inject into next turn", "Switch to session", "Cancel"]);
-	if (action === "Inject into next turn") {
-		const content = buildInjectedHistoryContent(selected, query);
-		pi.sendMessage(
-			{
-				customType: "project-history",
-				content,
-				display: true,
-				details: { query, result: serializeResult(selected) },
-			},
-			{ deliverAs: "nextTurn" },
+class ProjectHistorySearchPicker implements Component, Focusable {
+	private readonly input = new Input();
+	private results: ProjectHistorySearchResult[] = [];
+	private selectedIndex = 0;
+	private readonly maxVisible = 8;
+	private lastQuery = "";
+
+	constructor(
+		private readonly documents: readonly SearchDocument[],
+		private readonly options: Pick<ToolSearchOptions, "role" | "limit" | "query">,
+		private readonly theme: Theme,
+		private readonly keybindings: KeybindingsManager,
+		private readonly done: (result: ProjectHistorySearchResult | null) => void,
+		private readonly requestRender: () => void,
+	) {
+		this.input.setValue(options.query);
+		this.input.onEscape = () => this.done(null);
+		this.refreshResults(true);
+	}
+
+	get focused(): boolean {
+		return this.input.focused;
+	}
+
+	set focused(value: boolean) {
+		this.input.focused = value;
+	}
+
+	invalidate(): void {
+		this.input.invalidate();
+	}
+
+	handleInput(data: string): void {
+		if (this.keybindings.matches(data, "tui.select.cancel")) {
+			this.done(null);
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.confirm")) {
+			this.done(this.results[this.selectedIndex] ?? null);
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.up")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.requestRender();
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.down")) {
+			this.selectedIndex = Math.min(Math.max(0, this.results.length - 1), this.selectedIndex + 1);
+			this.requestRender();
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.pageUp")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisible);
+			this.requestRender();
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.pageDown")) {
+			this.selectedIndex = Math.min(Math.max(0, this.results.length - 1), this.selectedIndex + this.maxVisible);
+			this.requestRender();
+			return;
+		}
+
+		const before = this.input.getValue();
+		this.input.handleInput(data);
+		if (this.input.getValue() !== before) {
+			this.refreshResults(true);
+		}
+		this.requestRender();
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(20, width);
+		const queryTokens = splitHistoryQuery(this.input.getValue());
+		const lines = [
+			this.theme.fg("accent", this.theme.bold("Project History")),
+			this.theme.fg("dim", `Type regex tokens separated by spaces (OR). Results are newest first.`),
+			...this.input.render(safeWidth),
+			this.theme.fg("dim", "↑↓ select · type to filter · enter choose · esc cancel"),
+			this.theme.fg("dim", `role=${this.options.role} · ${this.results.length} shown`),
+		];
+
+		if (this.results.length === 0) {
+			lines.push(this.theme.fg("warning", "No matching project history prompts."));
+			return lines.map((line) => truncateToWidth(line, safeWidth, "…"));
+		}
+
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.results.length - this.maxVisible),
 		);
-		ctx.ui.setEditorText("Using the project history above, ");
-		ctx.ui.notify("Project history snippet queued for the next turn.", "info");
+		const endIndex = Math.min(startIndex + this.maxVisible, this.results.length);
+
+		for (let index = startIndex; index < endIndex; index += 1) {
+			const result = this.results[index];
+			if (!result) continue;
+			const selected = index === this.selectedIndex;
+			const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
+			const metadata = truncateToWidth(`${prefix}${formatHistoryResultMetadata(result)}`, safeWidth, "…");
+			const highlightedSnippet = highlightHistorySnippet(result.snippet, queryTokens, (text) =>
+				this.theme.fg("accent", this.theme.bold(text)),
+			);
+			const snippet = truncateToWidth(`  ${highlightedSnippet}`, safeWidth, "…");
+			lines.push(selected ? this.theme.bg("selectedBg", padToWidth(metadata, safeWidth)) : metadata);
+			lines.push(selected ? this.theme.bg("selectedBg", padToWidth(snippet, safeWidth)) : snippet);
+		}
+
+		if (startIndex > 0 || endIndex < this.results.length) {
+			lines.push(this.theme.fg("dim", `(${this.selectedIndex + 1}/${this.results.length})`));
+		}
+
+		return lines.map((line) => truncateToWidth(line, safeWidth, "…"));
+	}
+
+	private refreshResults(resetSelection: boolean): void {
+		const query = this.input.getValue();
+		this.results = searchHistoryDocuments(this.documents, {
+			query,
+			role: this.options.role,
+			limit: this.options.limit,
+			maxSnippetLength: HISTORY_PICKER_SNIPPET_LENGTH,
+		});
+
+		if (resetSelection || query !== this.lastQuery) {
+			this.selectedIndex = 0;
+		} else {
+			this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.results.length - 1));
+		}
+		this.lastQuery = query;
+	}
+}
+
+async function pickHistoryResult(
+	ctx: ExtensionCommandContext,
+	documents: readonly SearchDocument[],
+	options: Pick<ToolSearchOptions, "role" | "limit" | "query">,
+): Promise<ProjectHistorySearchResult | null> {
+	return ctx.ui.custom<ProjectHistorySearchResult | null>((tui, theme, keybindings, done) =>
+		new ProjectHistorySearchPicker(documents, options, theme, keybindings, done, () => tui.requestRender()),
+	);
+}
+
+async function handleSelectedHistoryAction(
+	ctx: ExtensionCommandContext,
+	selected: ProjectHistorySearchResult,
+): Promise<void> {
+	const restoreAction = selected.role === "user" ? "Restore prompt to editor" : "Copy message text to editor";
+	const action = await ctx.ui.select("History action", [restoreAction, "Switch to session", "Cancel"]);
+	if (action === restoreAction) {
+		ctx.ui.setEditorText(selected.text);
+		ctx.ui.notify(
+			selected.role === "user"
+				? "Restored project history prompt to the editor."
+				: "Copied project history message text to the editor.",
+			"info",
+		);
 		return;
 	}
 
@@ -309,31 +439,96 @@ async function handleInteractiveActions(
 	}
 }
 
+function historyArgumentCompletions(
+	query: string,
+	promptHistory: readonly ProjectHistoryPrompt[],
+): AutocompleteItem[] | null {
+	const results = searchHistoryDocuments(promptHistory, {
+		query,
+		role: "user",
+		limit: COMMAND_COMPLETION_LIMIT,
+		maxSnippetLength: 160,
+	});
+	if (results.length === 0) return null;
+
+	return results.map((result) => {
+		const value = compactCompletionValue(result.text, 240);
+		return {
+			value,
+			label: compactLabel(result.text, 80),
+			description: formatHistoryResultMetadata(result),
+		};
+	});
+}
+
 export default function projectHistoryExtension(pi: ExtensionAPI): void {
 	const cache = new Map<string, CachedSessionDocuments>();
+	let promptHistoryCompletions: ProjectHistoryPrompt[] = [];
+
+	pi.on("session_start", async (event, ctx) => {
+		if (!ctx.hasUI) return;
+
+		setStatus(ctx, "history prompts");
+		try {
+			const includeCurrentSession = event.reason === "reload";
+			const loaded = await loadProjectHistory(ctx, cache, { includeCurrentSession });
+			const promptHistory = collectUserPromptHistory(loaded.documents, {
+				limit: EDITOR_PROMPT_HISTORY_LIMIT,
+			});
+			promptHistoryCompletions = promptHistory;
+			const previousEditorFactory = ctx.ui.getEditorComponent();
+
+			ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+				const editor = previousEditorFactory
+					? previousEditorFactory(tui, theme, keybindings)
+					: new InlineSlashAutocompleteEditor(tui, theme, keybindings, () => pi.getCommands());
+				const addToHistory = editor.addToHistory?.bind(editor);
+				if (addToHistory) seedPromptHistory({ addToHistory }, promptHistory);
+				return editor;
+			});
+
+			ctx.ui.setStatus(
+				PROMPT_HISTORY_STATUS_KEY,
+				promptHistory.length > 0 ? ctx.ui.theme.fg("dim", `history ↑↓ ${promptHistory.length}`) : undefined,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Project history prompt history unavailable: ${message}`, "warning");
+			ctx.ui.setStatus(PROMPT_HISTORY_STATUS_KEY, undefined);
+		} finally {
+			setStatus(ctx, undefined);
+		}
+	});
 
 	pi.registerCommand("history", {
 		description: "Search saved pi sessions for this project. Usage: /history [--role user|assistant|all] [--limit 1-50] <query>",
+		getArgumentCompletions: (prefix) => historyArgumentCompletions(prefix, promptHistoryCompletions),
 		handler: async (args, ctx) => {
 			const options = await promptForQuery(args, ctx);
 			if (!options) return;
 
-			const { loaded, results, formatted } = await runSearch(ctx, cache, options);
 			if (!ctx.hasUI) {
+				const { formatted } = await runSearch(ctx, cache, options);
 				notifyOrPrint(ctx, formatted, "info");
 				return;
 			}
 
-			if (results.length === 0) {
-				ctx.ui.notify(formatted, "info");
+			setStatus(ctx, "history search");
+			let loaded: LoadedHistory;
+			try {
+				loaded = await loadProjectHistory(ctx, cache, { includeCurrentSession: options.includeCurrentSession });
+			} finally {
+				setStatus(ctx, undefined);
+			}
+
+			if (loaded.documents.length === 0) {
+				ctx.ui.notify("No project history messages found for this project.", "info");
 				return;
 			}
 
-			ctx.ui.notify(
-				`Found ${results.length} project history match(es) across ${loaded.sessions.length} session(s).`,
-				"info",
-			);
-			await handleInteractiveActions(pi, ctx, options.query, results);
+			const selected = await pickHistoryResult(ctx, loaded.documents, options);
+			if (!selected) return;
+			await handleSelectedHistoryAction(ctx, selected);
 		},
 	});
 

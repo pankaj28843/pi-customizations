@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
+	collapseExpandedSkillReferences,
 	extractMessageText,
+	collectUserPromptHistory,
 	formatHistoryResults,
 	parseHistoryCommandArgs,
 	parseSessionFileText,
 	searchHistoryDocuments,
+	seedPromptHistory,
+	highlightHistorySnippet,
 	type ProjectHistorySession,
 } from "../src/project-history.js";
 
@@ -87,6 +91,31 @@ assert.equal(
 );
 assert.equal(extractMessageText([{ type: "image", data: "ignored" }]), "");
 
+const expandedSkillPrompt = [
+	"Please use",
+	"",
+	'<skill name="dev-tdd" location="/tmp/dev-tdd/SKILL.md">',
+	"References are relative to /tmp/dev-tdd.",
+	"",
+	"# Test Skill",
+	"Use the expanded skill body.",
+	"</skill>",
+	"",
+	"to write tests first",
+].join("\n");
+assert.equal(collapseExpandedSkillReferences(expandedSkillPrompt), "Please use /skill:dev-tdd to write tests first");
+const collapsedSkillDocuments = parseSessionFileText(
+	JSON.stringify({
+		type: "message",
+		id: "skill-u1",
+		timestamp: "2026-05-04T00:00:01.000Z",
+		message: { role: "user", content: expandedSkillPrompt },
+	}),
+	session,
+);
+assert.equal(collapsedSkillDocuments[0]?.text, "Please use /skill:dev-tdd to write tests first");
+assert.equal(collapsedSkillDocuments[0]?.text.includes("expanded skill body"), false);
+
 const documents = parseSessionFileText(jsonl, session);
 assert.deepEqual(
 	documents.map((doc) => `${doc.role}:${doc.entryId}`),
@@ -94,6 +123,53 @@ assert.deepEqual(
 );
 assert.equal(documents[0]?.sessionName, "Adapter Planning");
 assert.equal(documents[0]?.lineNumber, 2);
+
+const otherSession: ProjectHistorySession = {
+	path: "/tmp/pi-history/older.jsonl",
+	id: "session-older",
+	modified: new Date("2026-04-30T00:00:00.000Z"),
+};
+const olderDocuments = parseSessionFileText(
+	[
+		JSON.stringify({ type: "session", id: "session-older", timestamp: "2026-04-30T00:00:00.000Z" }),
+		JSON.stringify({
+			type: "message",
+			id: "older-u1",
+			timestamp: "2026-04-30T00:00:01.000Z",
+			message: { role: "user", content: "Older exact prompt from another session" },
+		}),
+		JSON.stringify({
+			type: "message",
+			id: "older-u2",
+			timestamp: "2026-04-30T00:00:02.000Z",
+			message: { role: "user", content: "Older exact prompt from another session" },
+		}),
+	].join("\n"),
+	otherSession,
+);
+const promptHistory = collectUserPromptHistory([...olderDocuments, ...documents], {
+	excludeSessionPath: session.path,
+	limit: 10,
+});
+assert.deepEqual(
+	promptHistory.map((entry) => entry.entryId),
+	["older-u2"],
+	"prompt history keeps newest exact prompt and excludes the active session",
+);
+assert.equal(promptHistory[0]?.text, "Older exact prompt from another session");
+const seededPrompts: string[] = [];
+seedPromptHistory({ addToHistory: (text: string) => seededPrompts.push(text) }, [
+	{ ...promptHistory[0]!, text: "newer prompt" },
+	{ ...promptHistory[0]!, entryId: "older", text: "older prompt" },
+]);
+assert.deepEqual(seededPrompts, ["older prompt", "newer prompt"], "seed newest-first prompts in editor browsing order");
+
+const recentByDefault = searchHistoryDocuments(documents, { query: "", role: "user", limit: 3 });
+assert.deepEqual(
+	recentByDefault.map((result) => result.entryId),
+	["u3", "u2", "u1"],
+	"empty history query lists recent prompts with the newest first",
+);
 
 const userOnlyNoAssistant = searchHistoryDocuments(documents, { query: "database vacuum" });
 assert.equal(userOnlyNoAssistant.length, 0);
@@ -104,8 +180,25 @@ assert.equal(allRoles[0]?.role, "assistant");
 assert.equal(allRoles[0]?.entryId, "a1");
 
 const ranked = searchHistoryDocuments(documents, { query: "adapter retries budget", role: "user", limit: 5 });
-assert.equal(ranked[0]?.entryId, "u1", "exact phrase-ish user ask should outrank token-only user ask");
-assert.ok((ranked[0]?.score ?? 0) > (ranked[1]?.score ?? 0));
+assert.deepEqual(
+	ranked.map((result) => result.entryId),
+	["u2", "u1"],
+	"history search is always reverse chronological, not score-ranked",
+);
+
+const orMatches = searchHistoryDocuments(documents, { query: "vacuum needle", role: "all", limit: 5 });
+assert.deepEqual(
+	orMatches.map((result) => result.entryId),
+	["u3", "a1"],
+	"space-separated query tokens match with OR semantics",
+);
+
+const regexMatches = searchHistoryDocuments(documents, { query: "schol(ar|astic) hist(or|amine)y", role: "user", limit: 5 });
+assert.deepEqual(
+	regexMatches.map((result) => result.entryId),
+	["u2", "u1"],
+	"query tokens are treated as regex patterns",
+);
 
 const snippetResult = searchHistoryDocuments(documents, {
 	query: "needle phrase",
@@ -118,6 +211,10 @@ assert.match(snippetResult[0]?.snippet ?? "", /needle phrase/);
 assert.ok((snippetResult[0]?.snippet.length ?? 0) <= 80);
 assert.ok(snippetResult[0]?.snippet.startsWith("…"));
 assert.ok(snippetResult[0]?.snippet.endsWith("…"));
+assert.equal(
+	highlightHistorySnippet(snippetResult[0]?.snippet ?? "", ["needle", "phr.se"], (text) => `[[${text}]]`),
+	(snippetResult[0]?.snippet ?? "").replace("needle phrase", "[[needle]] [[phrase]]"),
+);
 
 const formatted = formatHistoryResults(snippetResult, {
 	query: "needle phrase",

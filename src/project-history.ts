@@ -58,6 +58,19 @@ export interface HistoryResultsSummary {
 	maxOutputChars?: number;
 }
 
+export interface ProjectHistoryPrompt extends SearchDocument {
+	role: "user";
+}
+
+export interface PromptHistoryOptions {
+	limit?: number;
+	excludeSessionPath?: string | readonly string[];
+}
+
+export interface PromptHistorySink {
+	addToHistory(text: string): void;
+}
+
 interface InternalDocument {
 	entryId: string;
 	timestamp?: Date;
@@ -70,7 +83,10 @@ const DEFAULT_HISTORY_LIMIT = 8;
 const MAX_HISTORY_LIMIT = 50;
 const DEFAULT_SNIPPET_LENGTH = 320;
 const DEFAULT_MAX_OUTPUT_CHARS = 12_000;
+const DEFAULT_PROMPT_HISTORY_LIMIT = 100;
 const USAGE = "Usage: /history [--role user|assistant|all] [--limit 1-50] <query>";
+const EXPANDED_SKILL_BLOCK_PATTERN =
+	/(?:[ \t]*(?:\r?\n)){0,2}[ \t]*<skill\b[^>]*\bname=(["'])([^"']+)\1[^>]*>[\s\S]*?<\/skill>[ \t]*(?:(?:\r?\n)[ \t]*){0,2}/gi;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -109,87 +125,100 @@ function collapseWhitespace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
-function normalizeSearchText(text: string): string {
-	return collapseWhitespace(text).toLowerCase();
-}
-
-function tokenizeSearchText(text: string): string[] {
-	return text
-		.toLowerCase()
-		.split(/[^a-z0-9]+/)
+export function splitHistoryQuery(query: string): string[] {
+	return query
+		.split(/\s+/)
+		.map((part) => part.trim())
 		.filter(Boolean);
 }
 
-function uniqueTokens(text: string): string[] {
-	return [...new Set(tokenizeSearchText(text))];
+function escapeRegExp(text: string): string {
+	return text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
-function countOccurrences(values: readonly string[], token: string): number {
+interface CompiledHistoryQueryToken {
+	token: string;
+	regex: RegExp;
+	globalRegex: RegExp;
+}
+
+function compileHistoryQueryToken(token: string): CompiledHistoryQueryToken {
+	try {
+		return {
+			token,
+			regex: new RegExp(token, "isu"),
+			globalRegex: new RegExp(token, "gisu"),
+		};
+	} catch {
+		const escaped = escapeRegExp(token);
+		return {
+			token,
+			regex: new RegExp(escaped, "isu"),
+			globalRegex: new RegExp(escaped, "gisu"),
+		};
+	}
+}
+
+function compileHistoryQueryTokens(tokens: readonly string[]): CompiledHistoryQueryToken[] {
+	return tokens.map((token) => compileHistoryQueryToken(token));
+}
+
+function regexMatches(regex: RegExp, text: string): boolean {
+	regex.lastIndex = 0;
+	return regex.test(text);
+}
+
+function regexOccurrenceCount(regex: RegExp, text: string): number {
 	let count = 0;
-	for (const value of values) {
-		if (value === token) count += 1;
+	regex.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(text)) !== null) {
+		if (match[0].length === 0) {
+			regex.lastIndex += 1;
+			continue;
+		}
+		count += 1;
 	}
 	return count;
 }
 
-function tokensInOrder(text: string, tokens: readonly string[]): boolean {
-	let offset = 0;
-	for (const token of tokens) {
-		const index = text.indexOf(token, offset);
-		if (index === -1) return false;
-		offset = index + token.length;
-	}
-	return true;
-}
-
 function scoreDocument(
 	document: SearchDocument,
-	normalizedQuery: string,
-	queryTokens: readonly string[],
+	queryTokens: readonly CompiledHistoryQueryToken[],
 ): { score: number; matchedTokens: string[] } | undefined {
-	if (!normalizedQuery || queryTokens.length === 0) return undefined;
+	const text = document.text;
+	if (!text.trim()) return undefined;
+	if (queryTokens.length === 0) return { score: document.role === "user" ? 10 : 0, matchedTokens: [] };
 
-	const normalizedText = normalizeSearchText(document.text);
-	if (!normalizedText) return undefined;
+	const matchedTokens = queryTokens.filter((token) => regexMatches(token.regex, text));
+	if (matchedTokens.length === 0) return undefined;
 
-	const documentTokens = tokenizeSearchText(normalizedText);
-	const matchedTokens = queryTokens.filter((token) => documentTokens.includes(token));
-	const phraseIndex = normalizedText.indexOf(normalizedQuery);
-
-	if (phraseIndex === -1 && matchedTokens.length === 0) return undefined;
-
-	let score = 0;
-	if (phraseIndex !== -1) {
-		score += 1_000;
-		if (phraseIndex === 0) score += 50;
-	}
-
+	let score = matchedTokens.length * 100;
 	for (const token of matchedTokens) {
-		score += 30 * countOccurrences(documentTokens, token);
+		score += regexOccurrenceCount(token.globalRegex, text);
 	}
-
-	if (matchedTokens.length === queryTokens.length) score += 150;
-	if (tokensInOrder(normalizedText, queryTokens)) score += 75;
 	if (document.role === "user") score += 10;
 
-	return { score, matchedTokens };
+	return { score, matchedTokens: matchedTokens.map((token) => token.token) };
 }
 
-function createSnippet(text: string, normalizedQuery: string, queryTokens: readonly string[], maxLength: number): string {
+function findFirstRegexMatchIndex(text: string, queryTokens: readonly CompiledHistoryQueryToken[]): number {
+	let matchIndex = -1;
+	for (const token of queryTokens) {
+		token.globalRegex.lastIndex = 0;
+		const match = token.globalRegex.exec(text);
+		if (!match || match[0].length === 0) continue;
+		if (matchIndex === -1 || match.index < matchIndex) matchIndex = match.index;
+	}
+	return matchIndex;
+}
+
+function createSnippet(text: string, queryTokens: readonly CompiledHistoryQueryToken[], maxLength: number): string {
 	const compact = collapseWhitespace(text);
 	const max = Math.max(20, Math.floor(maxLength));
 	if (compact.length <= max) return compact;
 
-	const lower = compact.toLowerCase();
-	let matchIndex = normalizedQuery ? lower.indexOf(normalizedQuery) : -1;
-	if (matchIndex === -1) {
-		const tokenIndexes = queryTokens
-			.map((token) => lower.indexOf(token))
-			.filter((index) => index >= 0)
-			.sort((a, b) => a - b);
-		matchIndex = tokenIndexes[0] ?? 0;
-	}
-
+	const matchIndex = Math.max(0, findFirstRegexMatchIndex(compact, queryTokens));
 	const initialWindow = Math.max(1, max - 2);
 	let start = Math.max(0, matchIndex - Math.floor(initialWindow / 2));
 	let end = Math.min(compact.length, start + initialWindow);
@@ -210,6 +239,75 @@ function createSnippet(text: string, normalizedQuery: string, queryTokens: reado
 		snippet = `${snippet.slice(0, Math.max(0, max - 1))}…`;
 	}
 	return snippet;
+}
+
+interface MatchRange {
+	start: number;
+	end: number;
+}
+
+function findRegexMatchRanges(text: string, queryTokens: readonly CompiledHistoryQueryToken[]): MatchRange[] {
+	const ranges: MatchRange[] = [];
+	for (const token of queryTokens) {
+		token.globalRegex.lastIndex = 0;
+		let match: RegExpExecArray | null;
+		while ((match = token.globalRegex.exec(text)) !== null) {
+			if (match[0].length === 0) {
+				token.globalRegex.lastIndex += 1;
+				continue;
+			}
+			ranges.push({ start: match.index, end: match.index + match[0].length });
+		}
+	}
+
+	return ranges
+		.sort((a, b) => a.start - b.start || b.end - a.end)
+		.reduce<MatchRange[]>((merged, range) => {
+			const previous = merged[merged.length - 1];
+			if (!previous || range.start > previous.end) {
+				merged.push({ ...range });
+				return merged;
+			}
+			previous.end = Math.max(previous.end, range.end);
+			return merged;
+		}, []);
+}
+
+export function highlightHistorySnippet(
+	snippet: string,
+	queryTokens: readonly string[],
+	wrap: (text: string) => string,
+): string {
+	const compiledTokens = compileHistoryQueryTokens(queryTokens.filter((token) => token.trim().length > 0));
+	if (compiledTokens.length === 0 || !snippet) return snippet;
+
+	const ranges = findRegexMatchRanges(snippet, compiledTokens);
+	if (ranges.length === 0) return snippet;
+
+	const parts: string[] = [];
+	let offset = 0;
+	for (const range of ranges) {
+		if (range.start > offset) parts.push(snippet.slice(offset, range.start));
+		parts.push(wrap(snippet.slice(range.start, range.end)));
+		offset = range.end;
+	}
+	if (offset < snippet.length) parts.push(snippet.slice(offset));
+	return parts.join("");
+}
+
+export function collapseExpandedSkillReferences(text: string): string {
+	return text
+		.replace(
+			EXPANDED_SKILL_BLOCK_PATTERN,
+			(match: string, _quote: string, skillName: string, offset: number, fullText: string) => {
+				const before = offset > 0 && !/\s$/.test(fullText.slice(0, offset)) ? " " : "";
+				const afterIndex = offset + match.length;
+				const after = afterIndex < fullText.length && !/^\s/.test(fullText.slice(afterIndex)) ? " " : "";
+				return `${before}/skill:${skillName}${after}`;
+			},
+		)
+		.replace(/[ \t]{2,}/g, " ")
+		.trim();
 }
 
 export function extractMessageText(content: unknown): string {
@@ -272,7 +370,8 @@ export function parseSessionFileText(text: string, session: ProjectHistorySessio
 		const role = entry.message.role;
 		if (role !== "user" && role !== "assistant") continue;
 
-		const messageText = extractMessageText(entry.message.content);
+		const extractedText = extractMessageText(entry.message.content);
+		const messageText = role === "user" ? collapseExpandedSkillReferences(extractedText) : extractedText;
 		if (!messageText) continue;
 
 		const entryId = cleanOptionalString(entry.id) ?? `line-${index + 1}`;
@@ -306,28 +405,29 @@ export function parseSessionFileText(text: string, session: ProjectHistorySessio
 	});
 }
 
+function documentChronologyValue(document: SearchDocument): number {
+	return timeValue(document.timestamp) || timeValue(document.sessionModified) || timeValue(document.sessionCreated);
+}
+
 export function searchHistoryDocuments(
 	documents: readonly SearchDocument[],
 	options: ProjectHistorySearchOptions,
 ): ProjectHistorySearchResult[] {
-	const query = options.query.trim();
-	if (!query) return [];
-
 	const role = options.role ?? "user";
 	const limit = Math.min(Math.max(1, Math.floor(options.limit ?? DEFAULT_HISTORY_LIMIT)), MAX_HISTORY_LIMIT);
 	const maxSnippetLength = Math.max(20, Math.floor(options.maxSnippetLength ?? DEFAULT_SNIPPET_LENGTH));
-	const normalizedQuery = normalizeSearchText(query);
-	const queryTokens = uniqueTokens(query);
+	const queryTokens = splitHistoryQuery(options.query);
+	const compiledTokens = compileHistoryQueryTokens(queryTokens);
 
 	return documents
 		.filter((document) => role === "all" || document.role === role)
 		.map((document) => {
-			const scored = scoreDocument(document, normalizedQuery, queryTokens);
+			const scored = scoreDocument(document, compiledTokens);
 			if (!scored) return undefined;
 			const result: ProjectHistorySearchResult = {
 				...document,
 				score: scored.score,
-				snippet: createSnippet(document.text, normalizedQuery, queryTokens, maxSnippetLength),
+				snippet: createSnippet(document.text, compiledTokens, maxSnippetLength),
 				matchedTokens: scored.matchedTokens,
 			};
 			return result;
@@ -335,13 +435,54 @@ export function searchHistoryDocuments(
 		.filter((result): result is ProjectHistorySearchResult => result !== undefined)
 		.sort(
 			(a, b) =>
-				b.score - a.score ||
-				timeValue(b.sessionModified) - timeValue(a.sessionModified) ||
-				timeValue(b.timestamp) - timeValue(a.timestamp) ||
+				documentChronologyValue(b) - documentChronologyValue(a) ||
+				(b.lineNumber ?? 0) - (a.lineNumber ?? 0) ||
 				a.sessionPath.localeCompare(b.sessionPath) ||
 				a.entryId.localeCompare(b.entryId),
 		)
 		.slice(0, limit);
+}
+
+function excludedSessionPaths(value: string | readonly string[] | undefined): Set<string> {
+	if (value === undefined) return new Set();
+	return new Set((Array.isArray(value) ? value : [value]).filter((path) => path.trim().length > 0));
+}
+
+export function collectUserPromptHistory(
+	documents: readonly SearchDocument[],
+	options: PromptHistoryOptions = {},
+): ProjectHistoryPrompt[] {
+	const limit = Math.max(1, Math.floor(options.limit ?? DEFAULT_PROMPT_HISTORY_LIMIT));
+	const excludedPaths = excludedSessionPaths(options.excludeSessionPath);
+	const seenText = new Set<string>();
+	const prompts: ProjectHistoryPrompt[] = [];
+
+	const newestFirst = documents
+		.filter((document) => document.role === "user" && !excludedPaths.has(document.sessionPath) && document.text.trim())
+		.sort(
+			(a, b) =>
+				documentChronologyValue(b) - documentChronologyValue(a) ||
+				b.sessionPath.localeCompare(a.sessionPath) ||
+				b.entryId.localeCompare(a.entryId),
+		);
+
+	for (const document of newestFirst) {
+		const text = document.text.trim();
+		if (seenText.has(text)) continue;
+		seenText.add(text);
+		prompts.push({ ...document, role: "user", text });
+		if (prompts.length >= limit) break;
+	}
+
+	return prompts;
+}
+
+export function seedPromptHistory(sink: PromptHistorySink, promptsNewestFirst: readonly ProjectHistoryPrompt[]): void {
+	for (let index = promptsNewestFirst.length - 1; index >= 0; index -= 1) {
+		const prompt = promptsNewestFirst[index];
+		if (!prompt?.text.trim()) continue;
+		sink.addToHistory(prompt.text);
+	}
 }
 
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
